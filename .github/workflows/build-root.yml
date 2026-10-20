@@ -1,0 +1,78 @@
+﻿name: build-root
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_size:
+        description: size of the HFS+ root image
+        default: "16G"
+
+env:
+  IPSW_URL: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+  OS_DMG: 087-86698-044.dmg
+  SYSOS_DMG: 087-86593-047.dmg
+  APPOS_DMG: 087-86715-047.dmg
+
+jobs:
+  root:
+    name: iOS 16.7.16 root image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: topaz
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hfsprogs rsync zlib1g-dev libssl-dev libfuse3-dev libjsoncpp-dev cmake g++ cpio android-sdk-libsparse-utils
+          sudo modprobe fuse || true
+          sudo modprobe hfsplus || true
+          ls -l /dev/fuse
+      - name: Build apfs-fuse
+        run: |
+          git clone --depth 1 https://github.com/sgan81/apfs-fuse
+          cd apfs-fuse
+          mkdir -p build && cd build
+          cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS="-include cstdint" ..
+          make -j$(nproc)
+          sudo cp apfs-fuse /usr/local/bin/apfs-fuse
+          apfs-fuse --help 2>&1 | head -3
+      - name: Download the iOS disk images from Apple
+        run: |
+          mkdir -p dmgs
+          python3 tools/remotezip.py "$IPSW_URL" "$OS_DMG" dmgs
+          python3 tools/remotezip.py "$IPSW_URL" "$SYSOS_DMG" dmgs
+          python3 tools/remotezip.py "$IPSW_URL" "$APPOS_DMG" dmgs
+          ls -l dmgs
+          df -h /
+      - name: Build the iOS root volume
+        run: |
+          sudo bash tools/mkiosroot.sh "dmgs/$OS_DMG" "dmgs/$SYSOS_DMG" "dmgs/$APPOS_DMG" ios16-root.img "${{ inputs.root_size }}"
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sudo umount /mnt/iosroot
+          sudo fsck.hfsplus -fy ios16-root.img || true
+          rm -rf dmgs
+          df -h /
+      - name: Make the sparse image
+        run: |
+          img2simg ios16-root.img ios16-root.simg
+          rm -f ios16-root.img
+          ls -l ios16-root.simg
+          sha256sum ios16-root.simg | tee ios16-root.simg.sha256
+      - name: Split for upload
+        run: |
+          split -b 1400M -d ios16-root.simg ios16-root.simg.part-
+          ls -l ios16-root.simg.part-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios16-root-simg
+          path: ios16-root.simg.part-*
+          retention-days: 30
+          if-no-files-found: error

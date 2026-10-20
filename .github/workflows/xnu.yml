@@ -153,3 +153,5 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+# forked build: keep the workflow file in the fork's default branch so Actions registers it
