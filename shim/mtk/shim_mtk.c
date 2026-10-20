@@ -20,6 +20,41 @@
 #include <stdint.h>
 #include "console.h"
 #include "uart.h"
+#include "loader.h"
+
+/* PSCI over SMCCC (SMC64), as the topaz shim does it. */
+#define PSCI_VERSION		0x84000000UL
+#define PSCI_CPU_ON		0xc4000003UL
+
+/* The A75s of merlin: cluster 1, MPIDR 0x600 and 0x700. */
+#define A75_MPIDR_FIRST		0x600
+#define A75_MPIDR_SECOND	0x700
+
+static uint64_t
+smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+	register uint64_t x0 __asm__("x0") = fn;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+	register uint64_t x4 __asm__("x4") = a4;
+
+	__asm__ volatile("smc #0"
+			 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
+			 :
+			 : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
+			   "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
+/* The tree lk handed us, for the core we start later. */
+static uint64_t secondary_dtb;
+
+/* start_mtk.S: the entry point for a core we start with PSCI CPU_ON. */
+extern void secondary_entry(void);
+
+/* What the target CPU reads when it comes up. */
+static uint64_t cpu_context[2] __attribute__((aligned(16)));
 
 #define FDT_MAGIC	0xd00dfeed
 #define FDT_BEGIN_NODE	1
@@ -172,14 +207,44 @@ void shim_main(uint64_t dtb)
 
 	con_skip();
 	if (((mmfr0 >> 20) & 0xf) == 0) {
-		banner("NO 16K GRANULE HERE - A75 HANDOFF NEEDED");
-	} else {
-		banner("16K GRANULE OK");
-	}
-	banner("STAGE 1 OK - HOLD POWER TO REBOOT");
-	uart_puts("stage 1 ok\n");
+		/*
+		 * No 16K granule here (an A53): xnu needs 16K pages, so the
+		 * work has to continue on one of the A75s.
+		 */
+		banner("NO 16K GRANULE - HANDING OFF TO AN A75");
+		secondary_dtb = dtb;
+		cpu_context[0] = (uint64_t)secondary_entry;
+		cpu_context[1] = 0;
 
-	/* Nothing more to do until the A75 handoff and XNU exist. */
+		__asm__ volatile("dsb sy" ::: "memory");
+		/* ARM PSCI: x1 = target, x2 = context id, x3 = entry, x4 = context */
+		uint64_t r = smc(PSCI_CPU_ON, A75_MPIDR_FIRST, 0,
+		    (uintptr_t)secondary_entry, (uintptr_t)cpu_context);
+		if (r != 0) {
+			/* some implementations take (target, entry, context id) */
+			r = smc(PSCI_CPU_ON, A75_MPIDR_FIRST,
+			    (uintptr_t)secondary_entry, 0, (uintptr_t)cpu_context);
+		}
+		con_hex("CPU_ON", r);
+		uart_puts("cpu_on -> ");
+		uart_hex(r);
+		uart_puts("\n");
+		if (r != 0) {
+			r = smc(PSCI_CPU_ON, A75_MPIDR_SECOND, 0,
+			    (uintptr_t)secondary_entry, (uintptr_t)cpu_context);
+			con_hex("CPU_ON2", r);
+		}
+		for (;;)
+			__asm__ volatile("wfi");
+	}
+
+	banner("16K GRANULE OK - BOOTING XNU");
+	uart_puts("16k ok, loading xnu\n");
+	const char *why = loader_boot((uintptr_t)dtb);
+	banner(why);
+	uart_puts("loader: ");
+	uart_puts(why);
+	uart_puts("\n");
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -200,12 +265,22 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		__asm__ volatile("wfe");
 }
 
-/* A second core, once someone starts it: nothing to do yet. */
+/*
+ * The core we started with PSCI: it has the 16K granule, so it does the
+ * real work - copy the xnu payload into place and jump into it.
+ */
 void secondary_main(uint64_t idx)
 {
 	con_str("CPU-ON", "secondary started");
 	line2("SEC", "idx=", (uint32_t)idx, "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	uart_puts("secondary up\n");
+	con_skip();
+	banner("BOOTING XNU FROM THE A75");
+	const char *why = loader_boot((uintptr_t)secondary_dtb);
+	banner(why);
+	uart_puts("loader: ");
+	uart_puts(why);
+	uart_puts("\n");
 	for (;;)
 		__asm__ volatile("wfe");
 }
