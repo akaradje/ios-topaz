@@ -1,0 +1,24 @@
+name: shim-mtk
+on:
+  push:
+    branches: [merlin]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: build the merlin shim
+        run: bash shim/build-mtk.sh
+      - name: show the image
+        run: |
+          aarch64-linux-gnu-readelf -h shim/out-mtk/shim-mtk.elf
+          aarch64-linux-gnu-objdump -d shim/out-mtk/shim-mtk.elf | head -80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-mtk
+          path: shim/out-mtk/
