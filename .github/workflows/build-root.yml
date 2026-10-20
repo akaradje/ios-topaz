@@ -1,4 +1,4 @@
-﻿name: build-root
+name: build-root
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y hfsprogs rsync zlib1g-dev libssl-dev libfuse3-dev libjsoncpp-dev cmake g++ cpio android-sdk-libsparse-utils
+          sudo apt-get install -y hfsprogs rsync libbz2-dev liblz4-dev libzstd-dev zlib1g-dev libssl-dev libfuse3-dev libjsoncpp-dev cmake g++ cpio android-sdk-libsparse-utils
           sudo modprobe fuse || true
           sudo modprobe hfsplus || true
           ls -l /dev/fuse
