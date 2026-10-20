@@ -35,8 +35,10 @@ jobs:
           ls -l /dev/fuse
       - name: Build apfs-fuse
         run: |
-          git clone --depth 1 https://github.com/sgan81/apfs-fuse
+          git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse
           cd apfs-fuse
+          git submodule update --init --recursive
+          ls 3rdparty/lzfse/src/lzfse.h
           mkdir -p build && cd build
           cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS="-include cstdint" ..
           make -j$(nproc)
