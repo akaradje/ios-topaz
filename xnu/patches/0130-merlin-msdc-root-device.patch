@@ -12,14 +12,14 @@ index 21cdb5c..77314fb 100644
  bsd/dev/sweet_touch.c			standard
 
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index e6c74aa..7901994 100644
+index e6c74aa..f6f81f1 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
 @@ -784,6 +784,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  #endif
  
-+#if defined(ARM64_BOARD_CONFIG_MERLIN)
++#if defined(MERLIN)
 +//
 +//	MERLIN: root on a GPT partition of the internal eMMC (bsd/dev/merlin_msdc.c)
 +//
@@ -43,10 +43,10 @@ index e6c74aa..7901994 100644
 
 diff --git a/bsd/dev/merlin_msdc.c b/bsd/dev/merlin_msdc.c
 new file mode 100644
-index 0000000..aa4dbf7
+index 0000000..519d292
 --- /dev/null
 +++ b/bsd/dev/merlin_msdc.c
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,676 @@
 +﻿/*
 + * MERLIN internal eMMC root device (read only) - first draft.
 + *
@@ -64,7 +64,7 @@ index 0000000..aa4dbf7
 + * around every transfer and refuses writes: it only has to read the GPT
 + * and the iOS root.
 + */
-+#if defined(ARM64_BOARD_CONFIG_MERLIN)
++#if defined(MERLIN) || defined(ARM64_BOARD_CONFIG_MERLIN)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/buf.h>
@@ -86,6 +86,13 @@ index 0000000..aa4dbf7
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#ifndef BIT
++#define BIT(n)		(1U << (n))
++#endif
++#ifndef GENMASK
++#define GENMASK(h, l)	(((~0U) << (l)) & (~0U >> (31 - (h))))
++#endif
 +
 +#define MSDC_BASE	0x11230000UL
 +#define MSDC_TOP_BASE	0x11cd0000UL	/* msdc0_top: clock source and pad */
