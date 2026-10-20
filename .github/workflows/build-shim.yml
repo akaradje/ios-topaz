@@ -1,0 +1,68 @@
+name: build-shim
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run:
+        description: run id of an xnu workflow run to take the kernel from
+        required: true
+
+env:
+  MKBOOTIMG: python3 /opt/mkbootimg/mkbootimg.py
+  CMDLINE: debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30
+
+jobs:
+  shim:
+    name: topaz shim boot image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: topaz
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu python3-pip cpio
+          sudo mkdir -p /opt/mkbootimg
+          sudo pip3 install --break-system-packages mkbootimg
+          cp "$(python3 -c 'import mkbootimg,os;print(os.path.dirname(mkbootimg.__file__))')/mkbootimg.py" /opt/mkbootimg/mkbootimg.py
+          aarch64-linux-gnu-gcc --version | head -1
+          python3 /opt/mkbootimg/mkbootimg.py --help | head -2
+
+      - name: Fetch the kernel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.kernel_run }}
+        run: |
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n xnu-kernel -D xnu/out
+          ls -l xnu/out
+          sha256sum -c xnu/out/SHA256SUMS || true
+
+      - name: Build the Apple Device Tree
+        run: |
+          python3 tools/mkadt.py shim/out/topaz.adt --highmem
+          ls -l shim/out/topaz.adt
+
+      - name: Pack the XNU payload
+        run: |
+          python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/topaz.adt shim/out/payload.bin --cmdline "$CMDLINE"
+          ls -l shim/out/payload.bin
+
+      - name: Build the shim
+        run: |
+          shim/build.sh ../shim/out/payload.bin
+          ls -l shim/out/shim-boot.img shim/out/Image
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: topaz-shim
+          path: |
+            shim/out/shim-boot.img
+            shim/out/payload.bin
+            shim/out/topaz.adt
+            shim/out/Image
+          retention-days: 30
+          if-no-files-found: error
