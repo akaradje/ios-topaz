@@ -1,0 +1,714 @@
+﻿diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,6 +104,7 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/merlin_msdc.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -766,6 +766,24 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_MERLIN)
++//
++//	MERLIN: root on a GPT partition of the internal eMMC (bsd/dev/merlin_msdc.c)
++//
++	if (strcmp(rdBootVar, "msdcroot0") == 0) {
++		extern int merlin_msdc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int msdc_error = merlin_msdc_rootdev(root);
++		if (msdc_error) {
++			panic("IOFindBSDRoot: MERLIN eMMC root %s unavailable: %d", rdBootVar, msdc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
+diff --git a/bsd/dev/merlin_msdc.c b/bsd/dev/merlin_msdc.c
+new file mode 100644
+index 0000000..aa4dbf7
+--- /dev/null
++++ b/bsd/dev/merlin_msdc.c
+@@ -0,0 +1,669 @@
++﻿/*
++ * MERLIN internal eMMC root device (read only) - first draft.
++ *
++ * The Redmi Note 9 (merlin, MT6768) keeps its eMMC behind MediaTek's MSDC0
++ * at 0x11230000, 8 bit bus, GIC SPI 100, non removable.  The device tree
++ * node the kernel is given is /merlin-msdc.
++ *
++ * The register map, the DMA descriptor layout and the checksum come from
++ * the Linux driver for the same controller (drivers/mmc/host/mtk-sd.c);
++ * the command interface is the SD card spec one (SDC_CMD/ARG/RESP), which
++ * is what the "mediatek,msdc" device tree node means.
++ *
++ * Like the sweet UFS driver this one is polled, keeps the descriptors and
++ * a bounce buffer in one contiguous DMA allocation, cleans the caches
++ * around every transfer and refuses writes: it only has to read the GPT
++ * and the iOS root.
++ */
++#if defined(ARM64_BOARD_CONFIG_MERLIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define MSDC_BASE	0x11230000UL
++#define MSDC_TOP_BASE	0x11cd0000UL	/* msdc0_top: clock source and pad */
++
++#define MSDC_CFG	0x00
++#define MSDC_IOCON	0x04
++#define MSDC_INT	0x0c
++#define SDC_CFG		0x30
++#define SDC_CMD		0x34
++#define SDC_ARG		0x38
++#define SDC_STS		0x3c
++#define SDC_RESP0	0x40
++#define SDC_RESP1	0x44
++#define SDC_RESP2	0x48
++#define SDC_RESP3	0x4c
++#define MSDC_DMA_SA	0x90
++#define MSDC_DMA_CTRL	0x98
++#define MSDC_DMA_CFG	0x9c
++
++#define EMMC_TOP_CONTROL 0x00
++#define EMMC_TOP_CMD	0x04
++
++/* masks, from the Linux driver */
++#define MSDC_CFG_CKDRVEN	BIT(4)
++#define MSDC_CFG_CKDIV		GENMASK(15, 8)
++#define MSDC_DMA_CTRL_START	BIT(0)
++#define MSDC_DMA_CTRL_MODE	BIT(8)
++#define MSDC_DMA_CTRL_BRUSTSZ	GENMASK(14, 12)
++#define MSDC_DMA_CTRL_LASTBUF	BIT(10)
++#define MSDC_DMA_CFG_STS	BIT(0)
++#define MSDC_DMA_CFG_DECSEN	BIT(1)
++
++/* SD card spec command register */
++#define SDC_CMD_INDEX	GENMASK(5, 0)
++#define SDC_CMD_RESP	GENMASK(15, 8)
++#define SDC_CMD_READ	BIT(23)
++
++#define RESP_NONE	0x00
++#define RESP_136	0x01
++#define RESP_48		0x02
++#define RESP_48_BUSY	0x03
++
++/* SD card spec status register (to be checked against the MTK manual) */
++#define SDC_STS_CMDRDY	BIT(0)
++#define SDC_STS_CMDRDYERR BIT(1)
++#define SDC_STS_CMDTMO	BIT(2)
++#define SDC_STS_CRCERR	BIT(3)
++#define SDC_STS_RDY_FOR_DATA BIT(8)
++
++/* eMMC commands */
++#define MMC_GO_IDLE		0
++#define MMC_SEND_OP_COND	1
++#define MMC_ALL_SEND_CID	2
++#define MMC_SET_RELATIVE_ADDR	3
++#define MMC_SELECT_CARD		7
++#define MMC_SEND_IF_COND	8
++#define MMC_READ_MULTIPLE_BLOCK	18
++#define MMC_STOP_TRANSMISSION	12
++
++#define EMMC_BLOCK	512u		/* eMMC sectors are 512 bytes */
++#define BOUNCE_SIZE	(1u << 20)
++#define BD_CHUNK	(64u << 10)	/* BUFLEN is 16 bits */
++#define MAX_BD		64
++#define CMD_TIMEOUT_NS	(5ull * NSEC_PER_SEC)
++
++/* General purpose descriptor: one command plus its block descriptors. */
++struct gpdma_desc {
++	uint32_t gpd_info;
++	uint32_t next;
++	uint32_t ptr;
++	uint32_t gpd_data_len;
++	uint32_t arg;
++	uint32_t blknum;
++	uint32_t cmd;
++};
++#define GPDMA_DESC_BDP	BIT(1)
++
++/* Block descriptor: one buffer of the transfer. */
++struct bdma_desc {
++	uint32_t bd_info;
++	uint32_t next;
++	uint32_t ptr;
++	uint32_t bd_data_len;
++};
++#define BDMA_DESC_EOL		BIT(0)
++#define BDMA_DESC_CHECKSUM	GENMASK(15, 8)
++#define BDMA_DESC_BUFLEN	GENMASK(15, 0)
++
++/* Layout of the contiguous DMA allocation. */
++#define DMA_GPD		0x0000		/* two GPDs, 28 bytes each */
++#define DMA_BD		0x0040		/* MAX_BD * 16 bytes */
++#define DMA_BOUNCE	0x10000		/* 1 MiB bounce buffer */
++#define DMA_SIZE	(DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t top;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint16_t rca;
++	uint32_t cid[4];
++	uint64_t first_block, nblocks;
++	uint32_t secsize;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} ms;
++
++static LCK_GRP_DECLARE(merlin_msdc_grp, "merlin_msdc");
++static LCK_MTX_DECLARE(merlin_msdc_lock, &merlin_msdc_grp);
++
++static inline uint32_t
++msdc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ms.regs + off);
++}
++
++static inline void
++msdc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ms.regs + off) = v;
++}
++
++static inline uint32_t
++top_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ms.top + off);
++}
++
++static inline void
++top_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ms.top + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(ms.dma_pa + off), len, TRUE);
++}
++
++/* The descriptor checksum the controller verifies: 0xff - sum of the bytes. */
++static uint8_t
++dma_calcs(const uint8_t *buf, uint32_t len)
++{
++	uint32_t sum = 0;
++
++	for (uint32_t i = 0; i < len; i++)
++		sum += buf[i];
++	return 0xff - (uint8_t)sum;
++}
++
++/*
++ * One command. The response (if any) lands in resp[0..3].
++ */
++static int
++msdc_cmd(uint8_t index, uint32_t arg, uint8_t resp_type, uint32_t *resp)
++{
++	uint64_t deadline;
++
++	msdc_wr(SDC_ARG, arg);
++	msdc_wr(SDC_CMD, (index & SDC_CMD_INDEX) | ((uint32_t)resp_type << 8));
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t sts = msdc_rd(SDC_STS);
++		if (sts & SDC_STS_CMDRDY) {
++			msdc_wr(SDC_STS, sts);
++			break;
++		}
++		if (sts & (SDC_STS_CMDRDYERR | SDC_STS_CMDTMO | SDC_STS_CRCERR)) {
++			msdc_wr(SDC_STS, sts);
++			printf("MERLIN MSDC: command %u failed, status 0x%x\n", index, sts);
++			return EIO;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("MERLIN MSDC: command %u timed out\n", index);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	if (resp) {
++		resp[0] = msdc_rd(SDC_RESP0);
++		resp[1] = msdc_rd(SDC_RESP1);
++		resp[2] = msdc_rd(SDC_RESP2);
++		resp[3] = msdc_rd(SDC_RESP3);
++	}
++	return 0;
++}
++
++/* Bring the card up: idle, operating conditions, CID, RCA, select. */
++static int
++msdc_init_card(void)
++{
++	uint32_t resp[4];
++	int error;
++
++	/* Reset the card and wait for it to leave the busy state. */
++	error = msdc_cmd(MMC_GO_IDLE, 0, RESP_NONE, NULL);
++	if (error) {
++		return error;
++	}
++	delay(100);
++
++	/* Operating conditions: HCS, 2.7-3.6 V, not busy. */
++	for (int i = 0; i < 1000; i++) {
++		error = msdc_cmd(MMC_SEND_OP_COND, 0x40ff8000, RESP_48, resp);
++		if (error) {
++			return error;
++		}
++		if (resp[0] & (1u << 31)) {
++			break;
++		}
++		delay(1);
++	}
++	if (!(resp[0] & (1u << 31))) {
++		printf("MERLIN MSDC: card stays busy in SEND_OP_COND\n");
++		return EIO;
++	}
++
++	error = msdc_cmd(MMC_ALL_SEND_CID, 0, RESP_136, resp);
++	if (error) {
++		return error;
++	}
++	memcpy(ms.cid, resp, sizeof(ms.cid));
++
++	error = msdc_cmd(MMC_SET_RELATIVE_ADDR, 0, RESP_48_BUSY, resp);
++	if (error) {
++		return error;
++	}
++	ms.rca = (uint16_t)(resp[0] >> 16);
++
++	error = msdc_cmd(MMC_SELECT_CARD, (uint32_t)ms.rca << 16, RESP_48_BUSY, resp);
++	if (error) {
++		return error;
++	}
++	printf("MERLIN MSDC: card up, RCA 0x%04x\n", ms.rca);
++	return 0;
++}
++
++/* Read count blocks into the bounce buffer with the block DMA engine. */
++static int
++msdc_read_blocks(uint64_t lba, uint32_t count)
++{
++	struct gpdma_desc *gpd = (struct gpdma_desc *)(ms.dma + DMA_GPD);
++	struct bdma_desc *bd = (struct bdma_desc *)(ms.dma + DMA_BD);
++	uint64_t gpd_pa = ms.dma_pa + DMA_GPD;
++	uint64_t bd_pa = ms.dma_pa + DMA_BD;
++	uint64_t bounce_pa = ms.dma_pa + DMA_BOUNCE;
++	uint32_t len = count * EMMC_BLOCK;
++	uint32_t nbd = 0;
++	uint64_t deadline;
++
++	if (len > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++
++	bzero(gpd, 2 * sizeof(*gpd));
++	bzero(bd, MAX_BD * sizeof(*bd));
++
++	/* One block descriptor per BD_CHUNK of data. */
++	for (uint32_t done = 0; done < len; done += BD_CHUNK, nbd++) {
++		uint32_t chunk = MIN(BD_CHUNK, len - done);
++		uint64_t addr = bounce_pa + done;
++
++		bd[nbd].ptr = (uint32_t)addr;
++		bd[nbd].bd_data_len = chunk & BDMA_DESC_BUFLEN;
++		bd[nbd].next = (uint32_t)(bd_pa + (nbd + 1) * sizeof(*bd));
++		bd[nbd].bd_info = (nbd == 0) ? 0 : 0;
++	}
++	/* The last descriptor ends the chain and points back at the GPD. */
++	bd[nbd - 1].next = (uint32_t)gpd_pa;
++	bd[nbd - 1].bd_info |= BDMA_DESC_EOL;
++	for (uint32_t i = 0; i < nbd; i++) {
++		bd[i].bd_info &= ~BDMA_DESC_CHECKSUM;
++		bd[i].bd_info |= (uint32_t)dma_calcs((const uint8_t *)&bd[i], 16) << 8;
++	}
++
++	/* The GPD carries the command itself. */
++	gpd->gpd_info = GPDMA_DESC_BDP;
++	gpd->next = (uint32_t)(gpd_pa + sizeof(*gpd));
++	gpd->ptr = (uint32_t)bd_pa;
++	gpd->cmd = MMC_READ_MULTIPLE_BLOCK;
++	gpd->arg = (uint32_t)lba;
++	gpd->blknum = count;
++
++	dma_sync(DMA_GPD, 2 * sizeof(*gpd));
++	dma_sync(DMA_BD, nbd * sizeof(*bd));
++	__builtin_arm_dsb(0xf);
++
++	msdc_wr(MSDC_DMA_SA, (uint32_t)gpd_pa);
++	msdc_wr(MSDC_DMA_CTRL, (6u << 12) | MSDC_DMA_CTRL_MODE);	/* 64B bursts, BDMA */
++	msdc_wr(MSDC_DMA_CFG, MSDC_DMA_CFG_DECSEN);
++	msdc_wr(MSDC_DMA_CTRL, (6u << 12) | MSDC_DMA_CTRL_MODE | MSDC_DMA_CTRL_START);
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		if (msdc_rd(MSDC_DMA_CFG) & MSDC_DMA_CFG_STS) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("MERLIN MSDC: read of %u blocks at %llu timed out\n",
++			    count, (uint64_t)lba);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	msdc_wr(MSDC_DMA_CTRL, (6u << 12) | MSDC_DMA_CTRL_MODE);
++
++	/* Stop the multiple block transfer. */
++	msdc_cmd(MMC_STOP_TRANSMISSION, 0, RESP_NONE, NULL);
++
++	dma_sync(DMA_BOUNCE, len);
++	return 0;
++}
++
++/* Find one GPT partition by name and remember its block range. */
++static int
++msdc_find_partition(const char *want)
++{
++	const uint8_t *b = (const uint8_t *)(ms.dma + DMA_BOUNCE);
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	int error;
++
++	error = msdc_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("MERLIN MSDC: no GPT on the eMMC\n");
++		return ENXIO;
++	}
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("MERLIN MSDC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	error = msdc_read_blocks(entry_lba, (nent * esz + EMMC_BLOCK - 1) / EMMC_BLOCK);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first) {
++			return ENXIO;
++		}
++		ms.first_block = first;
++		ms.nblocks = last - first + 1;
++		return 0;
++	}
++	printf("MERLIN MSDC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++merlin_msdc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!ms.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++merlin_msdc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++merlin_msdc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * ms.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = ms.nblocks * EMMC_BLOCK;
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&merlin_msdc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / EMMC_BLOCK;
++		uint32_t skip = (uint32_t)(pos % EMMC_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + EMMC_BLOCK - 1) / EMMC_BLOCK;
++
++		error = msdc_read_blocks(ms.first_block + lba, blocks);
++		if (error) {
++			break;
++		}
++		memcpy(vaddr + done, (const void *)(ms.dma + DMA_BOUNCE + skip), want);
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&merlin_msdc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++merlin_msdc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = ms.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > EMMC_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		ms.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = EMMC_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = ms.nblocks * EMMC_BLOCK / ms.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / ms.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++merlin_msdc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return merlin_msdc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++merlin_msdc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return merlin_msdc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++merlin_msdc_psize(__unused dev_t dev)
++{
++	return ms.ready ? (int)MIN(ms.nblocks * EMMC_BLOCK / ms.secsize, INT_MAX) : -1;
++}
++
++static int
++merlin_msdc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(merlin_msdc_strategy, NULL, dev, B_READ, minphys, uio, (int)ms.secsize);
++}
++
++static int
++merlin_msdc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw merlin_msdc_bdevsw = {
++	.d_open     = merlin_msdc_open,
++	.d_close    = merlin_msdc_close,
++	.d_strategy = merlin_msdc_strategy,
++	.d_ioctl    = merlin_msdc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = merlin_msdc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw merlin_msdc_cdevsw = {
++	.d_open       = merlin_msdc_open,
++	.d_close      = merlin_msdc_close,
++	.d_read       = merlin_msdc_read,
++	.d_write      = merlin_msdc_write,
++	.d_ioctl      = merlin_msdc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++merlin_msdc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/merlin-msdc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("MERLIN MSDC: no /merlin-msdc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("msdcroot", want, sizeof(want));
++
++	ms.regs = ml_io_map(reg[0], reg[1]);
++	ms.top = ml_io_map(MSDC_TOP_BASE, 0x1000);
++	if (kmem_alloc_contig(kernel_map, &ms.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("MERLIN MSDC: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ms.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	ms.dma_pa = ptoa_64(pn);
++	ms.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&merlin_msdc_lock);
++	/*
++	 * Clock and bus setup. TODO: the msdc0 clock gate lives in topckgen
++	 * and the source select in the msdc0_top pad block; the values below
++	 * are placeholders until they are read out of the Linux driver.
++	 */
++	top_wr(EMMC_TOP_CONTROL, 0);
++	top_wr(EMMC_TOP_CMD, 0);
++	msdc_wr(MSDC_CFG, (400u << 8));		/* CKDIV: 400 kHz legacy clock */
++	msdc_wr(MSDC_CFG, msdc_rd(MSDC_CFG) | MSDC_CFG_CKDRVEN);
++	msdc_wr(SDC_CFG, 0);
++
++	error = msdc_init_card();
++	if (!error) {
++		error = msdc_find_partition(want);
++	}
++	lck_mtx_unlock(&merlin_msdc_lock);
++	if (error) {
++		return error;
++	}
++
++	ms.bmajor = bdevsw_add(-1, &merlin_msdc_bdevsw);
++	if (ms.bmajor < 0) {
++		return ENXIO;
++	}
++	ms.cmajor = cdevsw_add_with_bdev(-1, &merlin_msdc_cdevsw, ms.bmajor);
++	if (ms.cmajor < 0) {
++		return ENXIO;
++	}
++	ms.bdev = makedev(ms.bmajor, 0);
++	devfs_make_node(ms.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "msdcroot0");
++	devfs_make_node(makedev(ms.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rmsdroot0");
++	ms.ready = true;
++	printf("MERLIN MSDC: \"%s\": first block 0x%llx, %llu MiB, read-only\n",
++	    want, ms.first_block, ms.nblocks * EMMC_BLOCK >> 20);
++	return 0;
++}
++
++/* Root device for rd=msdcroot0 (IOFindBSDRoot). */
++int merlin_msdc_rootdev(dev_t *dev);
++
++int
++merlin_msdc_rootdev(dev_t *dev)
++{
++	if (!ms.ready) {
++		int error = merlin_msdc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = ms.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_MERLIN */
