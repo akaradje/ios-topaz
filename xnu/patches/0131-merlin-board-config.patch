@@ -1,4 +1,5 @@
-﻿diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 004c5fc..023463a 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
@@ -10,43 +11,35 @@
  
  endif
  
-@@ -62,7 +62,8 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=apple-
- MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
- MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
- MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
- MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+@@ -64,6 +64,7 @@ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53
 +MACHINE_FLAGS_ARM64_MERLIN = -DARM64_BOARD_CONFIG_MERLIN              -march=armv8.2-a+crypto
  
  
  #
+
 diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index c7d274f..52268cf 100644
 --- a/pexpert/pexpert/arm64/Makefile
 +++ b/pexpert/pexpert/arm64/Makefile
-@@ -17,8 +17,9 @@ PRIVATE_KERNELFILES = \
- 	boot.h \
+@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
  	H13.h \
  	VMAPPLE.h \
  	BCM2837.h \
- 	SWEET.h \
+-	SWEET.h
++	SWEET.h \
 +	MERLIN.h
  
  
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..181bbee 100644
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -97,16 +97,27 @@
- #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
- #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
- 
- #ifdef ARM64_BOARD_CONFIG_SWEET
- #include <pexpert/arm64/SWEET.h>
- 
- #define MAX_L2_CLINE                   6
- #define MAX_CPUS                       8
- #define MAX_CPU_CLUSTERS               1
- 
- #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+@@ -108,6 +108,17 @@
  
  #endif  /* ARM64_BOARD_CONFIG_SWEET */
  
@@ -63,6 +56,8 @@ diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_
 +
  #ifdef ARM64_BOARD_CONFIG_VMAPPLE
  #include <pexpert/arm64/VMAPPLE.h>
+ 
+
 diff --git a/pexpert/pexpert/arm64/MERLIN.h b/pexpert/pexpert/arm64/MERLIN.h
 new file mode 100644
 index 0000000..bcbfd0b
