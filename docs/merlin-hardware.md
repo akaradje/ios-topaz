@@ -144,3 +144,78 @@ section is a raw binary, so the shim can be an "Image" as on Qualcomm.
 - If the MediaTek preloader refuses the unlock, the port has no way in; the
   fallback is a different phone (a Redmi Note 12 4G would run the existing
   ios-topaz port as is).
+
+## 20 Oct 2026 (evening) - what the phone actually does
+
+Everything below was observed on the phone itself, not assumed.
+
+### The LK boot menu
+
+```
+Select Boot Mode:  (VOLUME_UP to select, VOLUME_DOWN is OK.)
+[Recovery  Mode]   -> the MIUI recovery (adb in sideload mode only)
+[Fastboot  Mode]   -> USB VID_0BB4&PID_0C01, interface class FF/42/03 (fastboot)
+[Normal   Boot]
+```
+
+- **VOLUME_UP moves the cursor, VOLUME_DOWN confirms** (not the other way round).
+- There is **no BROM entry** in the menu. BROM is reached from a cold
+  power-off: hold **Vol Up + Vol Down** while plugging the cable in.
+- Plugging the cable in with the phone off and **no buttons pressed** gives
+  the **preloader** (`USB\VID_0E8D&PID_0003`) which exposes a working
+  **COM port** - that is the path mtkclient talks to (`--serialport COMx`),
+  and it needs no extra driver.
+- The preloader also shows up as a HID-only device
+  (`USB\VID_0E8D&PID_20FF`, class 03) when Windows picks the HID driver;
+  WinUSB on that node (Zadig) makes it usable as well.
+
+### fastboot
+
+`USB\VID_0BB4&PID_0C01` is a real fastboot interface (class FF/42/03) but
+MediaTek uses its own VID, so Windows has no driver for it by default. The
+inbox `winusb.inf` only matches `Class_ff&SubClass_42&Prot_01`, so
+**Zadig -> WinUSB** on that node is what makes the AOSP fastboot tool work.
+
+`fastboot flashing unlock` fails on Xiaomi ("Unlock failed") - the phone
+needs Mi Unlock (authorised Mi account). The MTK path (`mtk.py da seccfg
+unlock`) does not need an account and is the way in.
+
+Useful numbers from `fastboot getvar all`:
+
+| item | value |
+| --- | --- |
+| product / bootloader | merlin, `merlin-f617d8537-20220822153313` |
+| boot | 0x4000000 (64 MiB) |
+| dtbo | 0x1000000 (16 MiB) |
+| vbmeta | 0x800000 |
+| metadata | 0x2000000 |
+| userdata | 0xc1f4f8000 (31 GiB) |
+| max-download-size | 0x8000000 (128 MiB) |
+| unlocked / secure | no / yes, anti 2 |
+
+`fastboot fetch` is not supported by this bootloader, so the stock boot
+image has to be read with mtkclient instead.
+
+### The LK handover (confirmed from the lk sources)
+
+`app/mt_boot/mt_boot.c`: `boot_linux()` -> `lk_jump64(entry, tags, 0,
+KERNEL_64BITS)`, so **x1 is the device tree lk built** (not x0 like Qualcomm
+ABL). That tree carries lk's own root properties - `atag,videolfb` (the
+framebuffer lk set up: base, size, width, height, depth, **linelength**),
+`atag,mem`, `atag,cmdline` and `bootargs` - so the shim reads the real
+geometry from it. `app/mt_boot/decompressor.c` gunzips the kernel section
+of a 64-bit boot image, so the shim and the XNU payload ride in there
+together (the decompressed size has to stay under 0x1C00000 = 28 MiB).
+
+The device tree of this phone says `/memory reg = 0x40000000+0x3e605000`,
+and the eMMC node is `/msdc@11230000` (reg 0x11230000+0x10000,
+**interrupts 0 100 8**, bus-width 8, max-frequency 200 MHz, non-removable).
+
+### The iOS root image
+
+The CI build-root artifact is a 5.98 GB zip holding `ios16-root.simg` split
+into parts; the sparse image itself is 12,145,439,044 bytes (11.31 GB).
+The sweet project flashes that image to **userdata**
+(`fastboot flash -S 512M userdata <img>.simg`), and the kernel boots it
+through the HFS+ driver with `rd=<root device>`. For merlin that is
+`rd=msdcroot0` with `msdcroot=userdata` naming the GPT partition.
