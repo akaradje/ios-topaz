@@ -219,3 +219,39 @@ The sweet project flashes that image to **userdata**
 (`fastboot flash -S 512M userdata <img>.simg`), and the kernel boots it
 through the HFS+ driver with `rd=<root device>`. For merlin that is
 `rd=msdcroot0` with `msdcroot=userdata` naming the GPT partition.
+
+## 21 Oct 2026 (morning) - the USB modes and what mtkclient needs
+
+### The USB modes of this phone, and how to reach them
+
+| what you do | what the PC sees |
+| --- | --- |
+| power off, plug in, press no button | preloader, `USB\VID_0E8D&PID_20FF`, **interface class 03 (HID)** - it is a keyboard, no serial |
+| power off, plug in, hold **Vol Up** | the MIUI recovery menu |
+| power off, plug in, hold **Vol Up + Vol Down** | preloader again (HID) |
+| power off, plug in, hold **Vol Up + Vol Down + Power** | preloader again (HID) |
+| `adb reboot bootloader` | the LK fastboot screen, `USB\VID_0BB4&PID_4E11` or `...&PID_4EE7` (fastboot interface, class FF/42/03) |
+| while the phone boots | the **BROM**, `USB\VID_0E8D&PID_0003`, a real CDC-ACM serial port (COM5) - visible for a second or two |
+
+Only the BROM has a usable serial port. The preloader's HID interface cannot be
+bound to a serial driver: Windows will create a COM port for it, but opening
+that port fails ("could not open port: The system cannot find the file
+specified") because the interface is not CDC-ACM at all.
+
+### mtkclient bugs hit on the way (all four are in the tool, not the phone)
+
+1. `mtk_main.py`: the subparser of argparse **resets `--serialport` to its own
+   default**, so the flag never reached the port. Fixed by reading the value
+   from `sys.argv` when `args.serialport` is None.
+2. `seriallib.py`: `detectdevices()` goes through pyusb and dies with
+   "Operation not supported or unimplemented on this platform" on this PC.
+   Fixed by trusting the port given on the command line and by wrapping the
+   enumeration in try/except.
+3. `seriallib.py`: it took the *first* detected port. The phone exposes a
+   broken port next to the working one, so it now tries every candidate and
+   keeps the first that really opens.
+4. `seriallib.py`: `connect()` gave up on the first miss. The BROM only shows
+   up for a second or two, so it now waits up to 120 s, polling every 100 ms.
+
+With those fixes `mtk.py --serialport DETECT printgpt` grabs the BROM's COM
+port within a second or two of the phone booting.
